@@ -11,6 +11,7 @@ public:
     DataType& get() { return buffer[_cur_index]; }
     DataType& get_next() { return buffer[1-_cur_index]; }
     void alter(){ _cur_index = 1-_cur_index;}
+    int current(){return _cur_index;}
 private:
     int _cur_index;
     DataType buffer[2];

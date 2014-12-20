@@ -1,7 +1,37 @@
 #include"xconfigor.h"
+#include"xini_file.h"
+#include"debug.h"
+#include<string>
+#include<iostream>
+#include<vector>
+#include<pthread.h>
+#include<errno.h>
+#include<unistd.h>
+#include<sys/types.h>
+#include<sys/stat.h>
 
-xconfigor::xconfigor:is_running(true)()
+#define TEST_XCONFIGOR 1
+
+using namespace std;
+void* configor_cb(void *arg);
+
+xconfigor::xconfigor():is_running(true)
 { }
+
+xconfigor::~xconfigor(){}
+
+static bool is_update_needed(xrecord& record, unsigned int &cur_file_time)
+{
+    struct stat f_st;
+    if(stat(record.file_name.c_str(),&f_st)!=0)
+        return false;
+    if(!S_ISREG(f_st.st_mode))
+        return false;
+    cur_file_time = f_st.st_mtime;
+    if( cur_file_time <= record.last_updated_time)
+        return false;
+    return true;
+}
 
 int xconfigor::init(const string &file_name)
 {
@@ -22,8 +52,8 @@ int xconfigor::init(const string &file_name)
 
 bool xconfigor::reload(const string &file_name, void *context)
 {
-    xdouble_buffer& confdata = *(xdouble_buffer<xconfigor_data> *)context;
-    xconfigor_data& next_data = confdata.get_next();
+    xdouble_buffer<xconfigor_data> & confdata = *(xdouble_buffer<xconfigor_data> *)context;
+    xconfigor_data & next_data = confdata.get_next();
     next_data.clear();
     xini_file ini_processor;
     if( true != ini_processor.init(file_name) )
@@ -33,17 +63,17 @@ bool xconfigor::reload(const string &file_name, void *context)
     }
     next_data.check_interval = ini_processor.get("xconfigor","check-interval",10);
     INFO("check-interval= %d\n",next_data.check_interval); 
-    next_data.retry_times = ini_processor.get("xconfigor","retry-times",1000);
+    next_data.retry_times = ini_processor.get("xconfigor","retry-times",10);
     INFO("retry-times = %d\n",next_data.retry_times);
-    next_data.retry_interval = ini_processor.get();
-    INFO("retry_interval = %d\n",next_data.retry_interval);
+    next_data.retry_interval = ini_processor.get("xconfigor","retry-interval",10);
+    INFO("retry-interval = %d\n",next_data.retry_interval);
     confdata.alter();
     return true;
 }
 
 bool xconfigor::regist(const string &file_name, void *context, load_func reloader, bool run_imediately)
 {
-    if( true != locker.get_write_permisson() ){
+    if( true != locker.get_write_permission() ){
         return false;
     }
     vector<xrecord>::iterator iter = records.begin();
@@ -86,8 +116,109 @@ bool xconfigor::regist(const string &file_name, void *context, load_func reloade
 
 void* configor_cb(void *arg)
 {
-
+    xconfigor &configor = *(xconfigor*)arg;
+    if( configor.running()==false )
+    {
+        ERROR("is not running.................. \n");
+        return NULL;
+    }
+    while( configor.running())
+    {
+        xconfigor_data& cdata = configor.config_data.get();
+        if(true != configor.locker.get_write_permission())
+        {
+            sleep(cdata.check_interval);
+            INFO("continue......................\n");
+            continue;
+        }
+        
+        vector<xrecord>::iterator iter = configor.records.begin();
+        for(;iter!=configor.records.end();++iter)
+        {
+            INFO("for in running ......\n");
+            unsigned int file_mtime = 0;
+            if(!is_update_needed(*iter,file_mtime))
+                continue;
+            int retried_times = cdata.retry_times;
+            do{
+                bool update_result = iter->reloader(iter->file_name,iter->context);
+                if(update_result)
+                {
+                    break;
+                }
+                usleep(cdata.retry_interval);
+            }while((--retried_times)>0);
+            if( retried_times <= 0 )
+            {
+                ERROR("can not be loaded successfully\n");
+            }else
+            {
+                iter->last_updated_time = file_mtime;
+                ERROR("has been loaded successfully\n");
+            }
+        }
+        configor.locker.release_permission();
+        sleep(cdata.check_interval);
+    }
+    return arg;
 }
+
+#if TEST_XCONFIGOR
+
+class person
+{
+    public:
+        string          name;
+        unsigned int    old;
+        int            sex;
+        person()
+        {
+            name="unknow";
+            old=0;
+            sex=0;
+        }
+};
+
+bool person_loader(const string &file_name, void *context)
+{
+    xdouble_buffer<person> &persons = *(xdouble_buffer<person>*)context;
+    person &next = persons.get_next();
+    xini_file file;
+    INFO("do person_loader\n");
+    if( true != file.init(file_name))
+    {
+        ERROR("xini_file.init error\n");
+        return false;
+    }
+    next.name = file.get("person","name","error");
+    next.old = file.get("person","old",0);
+    next.sex = file.get("person","sex",0);
+    persons.alter();
+    return true;
+}
+
+
+class test_person
+{
+    public:
+        int init(const string &file_name)
+        {
+           if( true != xconfigor::inst().regist(file_name,&data,person_loader,true))
+           {
+                ERROR("regist error\n");
+                return -1; 
+           }
+            INFO("init ok\n");
+            return 0;
+        }
+        void print()
+        {
+            std::cout<<"name:"<< data.get().name.c_str()<<"\n" <<std::endl;
+            std::cout<<"old:"<<data.get().old<<"\n"<<std::endl;
+            std::cout<<"sex:"<<data.get().sex<<"\n"<<std::endl;
+        }
+        xdouble_buffer<person> data;
+};
 
 int main(int argc, char** argv)
 {
@@ -97,10 +228,20 @@ int main(int argc, char** argv)
         return -1;
     }
     string configfile(argv[1]);
-    xconfigor.inst().init(configfile);
+    std::cout<<"configfile: "<<configfile.c_str()<<"\n"<<std::endl;
+    xconfigor::inst().init(configfile);
+    test_person per;
+    string person_file("./conf/person.ini");
+    if( 0!=per.init(person_file))
+    {
+        std::cout<<"per.init error\n"<<std::endl;
+        return -1;
+    }
     while(1)
     {
         sleep(1);
+        per.print();
     }
     return 0;
 }
+#endif
